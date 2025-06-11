@@ -15,6 +15,21 @@ from reportlab.lib.styles import getSampleStyleSheet
 import time
 import plotly.express as px
 import sklearn
+import torch
+import torch.nn as nn
+from torchvision import transforms
+from PIL import Image
+import io
+import warnings
+from pathlib import Path
+from sklearn.ensemble import RandomForestRegressor
+import joblib
+import asyncio
+import sys
+
+# Memory optimization
+os.environ["STREAMLIT_SERVER_ENABLE_FILE_WATCHER"] = "false"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Define classes for PPE detection
 PPE_CLASSES = [
@@ -22,13 +37,149 @@ PPE_CLASSES = [
     "no_glove", "no_goggles", "no_helmet", "no_shoes", "person", "vest"
 ]
 
-# Set page configuration
+# Set page configuration with improved theme
 st.set_page_config(
-    page_title="Construction Management System", 
+    page_title="🏗️ Construction Management System", 
     layout="wide",
     page_icon="🏗️",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
+    menu_items={
+        'Get Help': 'https://github.com/your-repo',
+        'Report a bug': "https://github.com/your-repo/issues",
+        'About': "# Construction Management System v1.0"
+    }
 )
+
+# Add custom CSS for better styling
+st.markdown("""
+<style>
+    /* Main container */
+    .stApp {
+        background-color: #f8f9fa;
+        color: #2B2B2B; /* Dark text for light background */
+    }
+    
+    /* Sidebar styling */
+    [data-testid="stSidebar"] {
+        background-color: #FDF6E3 !important;
+        color: #2B2B2B !important; /* Darker text for visibility */
+    }
+    
+    /* Sidebar header */
+    [data-testid="stSidebar"] h1,
+    [data-testid="stSidebar"] h2,
+    [data-testid="stSidebar"] h3 {
+        color: #2B2B2B !important;
+    }
+    
+    /* Button styling */
+    .stButton>button {
+        border: 1px solid #3498db;
+        background-color: #3498db;
+        color: white;
+        border-radius: 5px;
+        padding: 0.5rem 1rem;
+        transition: all 0.3s;
+    }
+    
+    .stButton>button:hover {
+        background-color: #2980b9;
+        border-color: #2980b9;
+    }
+    
+    /* Primary button */
+    .stButton>button:focus:not(:active) {
+        background-color: #2980b9;
+        border-color: #2980b9;
+    }
+    
+    /* Secondary button */
+    .css-1x8cf1d {
+        background-color: #6c757d;
+        border-color: #6c757d;
+        color: white;
+    }
+    
+    /* Cards and containers */
+    .css-1aumxhk {
+        background-color: white;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        padding: 1.5rem;
+        color: #2B2B2B;
+    }
+    
+    /* Metrics styling */
+    [data-testid="metric-container"] {
+        background-color: white;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        padding: 1rem;
+        color: #2B2B2B;
+    }
+    
+    /* Tab styling */
+    [role="tab"] {
+        padding: 0.5rem 1rem !important;
+        border-radius: 5px 5px 0 0 !important;
+        color: #2B2B2B !important;
+    }
+    
+    [role="tab"][aria-selected="true"] {
+        background-color: #3498db !important;
+        color: white !important;
+    }
+    
+    /* Progress bar */
+    .stProgress > div > div > div {
+        background-color: #3498db;
+    }
+    
+    /* Success messages */
+    .stAlert .st-b7 {
+        background-color: #d4edda !important;
+        color: #155724 !important;
+    }
+    
+    /* Error messages */
+    .stAlert .st-b8 {
+        background-color: #f8d7da !important;
+        color: #721c24 !important;
+    }
+    
+    /* Custom cards */
+    .custom-card {
+        background-color: white;
+        border-radius: 10px;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        padding: 1.5rem;
+        margin-bottom: 1rem;
+        color: #2B2B2B;
+    }
+    
+    /* Custom badges */
+    .custom-badge {
+        display: inline-block;
+        padding: 0.25rem 0.5rem;
+        border-radius: 5px;
+        font-size: 0.75rem;
+        font-weight: bold;
+        margin-right: 0.5rem;
+        margin-bottom: 0.5rem;
+        color: white;
+        background-color: #3498db;
+    }
+    
+    /* Custom headers */
+    .custom-header {
+        color: #2c3e50;
+        border-bottom: 2px solid #3498db;
+        padding-bottom: 0.5rem;
+        margin-bottom: 1rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 
 # Define the DetectionTracker class for PPE detection
 class DetectionTracker:
@@ -57,6 +208,108 @@ class DetectionTracker:
         self.person_safety_violations = []
         self.seen_persons = []
 
+# Generator Model Definition
+class Generator(nn.Module):
+    def __init__(self, input_channels=3, output_channels=3):
+        super(Generator, self).__init__()
+
+        def down_block(in_c, out_c):
+            return nn.Sequential(
+                nn.Conv2d(in_c, out_c, 4, 2, 1),
+                nn.BatchNorm2d(out_c),
+                nn.LeakyReLU(0.2)
+            )
+
+        def up_block(in_c, out_c, dropout=False):
+            layers = [
+                nn.ConvTranspose2d(in_c, out_c, 4, 2, 1),
+                nn.BatchNorm2d(out_c),
+                nn.ReLU()
+            ]
+            if dropout:
+                layers.append(nn.Dropout(0.5))
+            return nn.Sequential(*layers)
+
+        # Downsampling
+        self.down1 = nn.Sequential(
+            nn.Conv2d(input_channels, 64, 4, 2, 1),
+            nn.LeakyReLU(0.2)
+        )
+        self.down2 = down_block(64, 128)
+        self.down3 = down_block(128, 256)
+        self.down4 = down_block(256, 512)
+        self.down5 = down_block(512, 512)
+        self.down6 = down_block(512, 512)
+        self.bottleneck = down_block(512, 512)
+
+        # Upsampling
+        self.up1 = up_block(512, 512, dropout=True)
+        self.up2 = up_block(1024, 512, dropout=True)
+        self.up3 = up_block(1024, 512, dropout=True)
+        self.up4 = up_block(1024, 256)
+        self.up5 = up_block(512, 128)
+        self.up6 = up_block(256, 64)
+
+        # Final output
+        self.final = nn.Sequential(
+            nn.ConvTranspose2d(128, output_channels, 4, 2, 1),
+            nn.Tanh()
+        )
+
+    def forward(self, x):
+        # Encoder
+        d1 = self.down1(x)
+        d2 = self.down2(d1)
+        d3 = self.down3(d2)
+        d4 = self.down4(d3)
+        d5 = self.down5(d4)
+        d6 = self.down6(d5)
+        b = self.bottleneck(d6)
+
+        # Decoder with skip connections
+        u1 = self.up1(b)
+        u2 = self.up2(torch.cat([u1, d6], 1))
+        u3 = self.up3(torch.cat([u2, d5], 1))
+        u4 = self.up4(torch.cat([u3, d4], 1))
+        u5 = self.up5(torch.cat([u4, d3], 1))
+        u6 = self.up6(torch.cat([u5, d2], 1))
+
+        return self.final(torch.cat([u6, d1], 1))
+
+@st.cache_resource
+def load_generator():
+    """Load the pre-trained generator model"""
+    model = Generator().to(device)
+    generator_path = r"C:\minor\floor\generator_epoch_1668.pth"
+    
+    if not os.path.exists(generator_path):
+        st.error(f"Error: {generator_path} not found!")
+        return None
+
+    try:
+        model.load_state_dict(torch.load(generator_path, map_location=device))
+        model.eval()
+        return model
+    except Exception as e:
+        st.error(f"Error loading model: {str(e)}")
+        return None
+
+def preprocess_image(image):
+    """Convert uploaded image to model input format"""
+    transform = transforms.Compose([
+        transforms.Resize((256, 256)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    ])
+    return transform(image).unsqueeze(0).to(device)
+
+def tensor_to_image(tensor):
+    """Convert model output tensor to PIL Image"""
+    image = tensor.squeeze(0).permute(1, 2, 0).cpu().numpy()
+    image = (image + 1) / 2  # Scale from [-1, 1] to [0, 1]
+    image = (image * 255).astype(np.uint8)
+    return Image.fromarray(image)
+
 # Define all the functions for PPE detection
 def generate_pdf_report(tracker, output_file):
     """Generate a KPI dashboard-style PDF report"""
@@ -82,7 +335,7 @@ def generate_pdf_report(tracker, output_file):
     
     # Calculate violation rate
     if len(tracker.seen_persons) > 0:
-        violation_rate = f"{(len(tracker.person_safety_violations) / len(tracker.seen_persons) * 100):.1f}%"
+        violation_rate = f"{(len(tracker.person_safety_violations) / len(tracker.seen_persons)) * 100:.1f}%"
     else:
         violation_rate = "0%"
         
@@ -420,24 +673,331 @@ def recommend_suppliers(model_components, material_type, location, min_rating,
     # Return top N suppliers
     return recommended_suppliers.head(top_n)
 
+def floor_plan_generator_page():
+    st.markdown("""
+    <div class='custom-card'>
+        <h2 class='custom-header'>🏠 Floor Plan Generator</h2>
+        <p>Upload a building footprint image to generate a corresponding architectural floor plan.
+        This model was trained on the Hugging Face Floor Plan dataset.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    generator = load_generator()
+    if generator is None:
+        st.stop()
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        with st.container():
+            st.subheader("Input Footprint")
+            uploaded_file = st.file_uploader(
+                "Choose a footprint image (JPG/PNG)",
+                type=["jpg", "jpeg", "png"],
+                key="uploader"
+            )
+
+            if uploaded_file is not None:
+                try:
+                    input_image = Image.open(uploaded_file).convert("RGB")
+                    st.image(input_image, caption="Uploaded Footprint", use_column_width=True)
+
+                    if st.button("Generate Floor Plan", type="primary"):
+                        with st.spinner("Generating floor plan..."):
+                            input_tensor = preprocess_image(input_image)
+                            with torch.no_grad():
+                                output_tensor = generator(input_tensor)
+
+                            output_image = tensor_to_image(output_tensor)
+
+                            with col2:
+                                st.subheader("Generated Floor Plan")
+                                st.image(output_image, use_column_width=True)
+
+                                img_bytes = io.BytesIO()
+                                output_image.save(img_bytes, format="PNG")
+                                st.download_button(
+                                    label="Download Floor Plan",
+                                    data=img_bytes.getvalue(),
+                                    file_name="generated_floor_plan.png",
+                                    mime="image/png",
+                                    key="download"
+                                )
+                except Exception as e:
+                    st.error(f"Error processing image: {str(e)}")
+
+    with st.sidebar:
+        with st.container():
+            st.header("About")
+            st.markdown("""
+            <div class='custom-card'>
+                <p>This AI model generates architectural floor plans from building footprints.</p>
+                <p><b>How it works:</b></p>
+                <ol>
+                    <li>Upload a footprint image</li>
+                    <li>Click "Generate Floor Plan"</li>
+                    <li>View and download the result</li>
+                </ol>
+                <p><b>Tips for best results:</b></p>
+                <ul>
+                    <li>Use clear, well-defined footprint images</li>
+                    <li>Images should have good contrast</li>
+                    <li>Square-ish aspect ratios work best</li>
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)
+            st.markdown("---")
+            st.markdown("**Model Info**")
+            st.text(f"Device: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+            st.text("Model: generator.pth")
+
+def delay_predictor_page():
+    st.markdown("""
+    <div class='custom-card'>
+        <h2 class='custom-header'>⏱️ Construction Project Delay Predictor</h2>
+        <p>This app predicts the expected delay (in days) for construction projects in India based on various project parameters.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Main page for user input
+    st.header('Project Parameters')
+    st.markdown("Enter your project details below to get a delay prediction.")
+
+    def user_input_features():
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            city = st.selectbox('City', ['Bangalore', 'Mumbai', 'Ahmedabad', 'Hyderabad', 
+                                        'Delhi', 'Chennai', 'Kolkata', 'Pune'])
+            project_type = st.selectbox('Project Type', ['Residential', 'Bridge', 'Railway', 
+                                                       'Commercial', 'Metro', 'Hospital', 
+                                                       'Road', 'Industrial'])
+            project_size = st.number_input('Project Size (sq. m)', min_value=1000, max_value=100000, value=25000)
+            labor_count = st.number_input('Labor Count', min_value=50, max_value=2000, value=500)
+        
+        with col2:
+            equipment_count = st.number_input('Equipment Count', min_value=5, max_value=50, value=25)
+            avg_temp = st.number_input('Average Temperature (°C)', min_value=15.0, max_value=45.0, value=25.0)
+            rainfall = st.number_input('Rainfall (mm)', min_value=0.0, max_value=500.0, value=150.0)
+            milestone = st.selectbox('Milestone', ['Inspection', 'Structural Completion', 
+                                                  'Roofing', 'Handover', 'Foundation', 'Finishing'])
+            external_factor = st.selectbox('External Factor', ['Unknown', 'Land dispute', 
+                                                              'Funding issues', 'Environmental clearance delay'])
+        
+        data = {
+            'City': city,
+            'Project Type': project_type,
+            'Project Size (sq. m)': project_size,
+            'Labor Count': labor_count,
+            'Equipment Count': equipment_count,
+            'Avg Temperature (°C)': avg_temp,
+            'Rainfall (mm)': rainfall,
+            'Milestone': milestone,
+            'External Factor': external_factor
+        }
+        features = pd.DataFrame(data, index=[0])
+        return features
+
+    input_df = user_input_features()
+
+    # Display user input parameters
+    st.subheader('Your Project Details')
+    st.dataframe(input_df, use_container_width=True)
+
+    # Load the model
+    model_path = r"C:\Users\sanje\Downloads\Delay\Delay\construction_delay_model (1).pkl"
+    
+    try:
+        if os.path.exists(model_path):
+            model = joblib.load(model_path)
+            st.session_state['delay_model'] = model
+        else:
+            st.error(f"Model file not found at: {model_path}")
+            return
+    except Exception as e:
+        st.error(f"Error loading model: {e}")
+        return
+
+    # Make prediction (but don't show it yet)
+    if 'delay_model' in st.session_state:
+        prediction = st.session_state['delay_model'].predict(input_df)
+    else:
+        st.warning("Model not loaded. Please check the model path.")
+        return
+
+    # Button to show all results
+    if st.button('Predict Delay and Show Analysis', type="primary"):
+        # Show prediction
+        st.subheader('Prediction Result')
+        
+        delay_days = round(prediction[0], 1)
+        if delay_days <= 30:
+            st.success(f"Predicted Construction Delay: **{delay_days} days** (Low Risk)")
+        elif 30 < delay_days <= 90:
+            st.warning(f"Predicted Construction Delay: **{delay_days} days** (Moderate Risk)")
+        else:
+            st.error(f"Predicted Construction Delay: **{delay_days} days** (High Risk)")
+        
+        # Detailed analysis
+        st.subheader('Detailed Delay Analysis')
+        
+        # Risk assessment
+        if delay_days <= 30:
+            st.markdown("""
+            <div class='custom-card'>
+                <h4>✅ Low Delay Risk</h4>
+                <p>The project is likely to experience minimal delays (≤ 30 days).</p>
+                <p><b>Recommended Actions:</b></p>
+                <ul>
+                    <li>Maintain current operations</li>
+                    <li>Monitor for any changes in conditions</li>
+                    <li>Standard risk management procedures are sufficient</li>
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)
+        elif 30 < delay_days <= 90:
+            st.markdown("""
+            <div class='custom-card'>
+                <h4>⚠️ Moderate Delay Risk</h4>
+                <p>The project may experience significant delays (31-90 days).</p>
+                <p><b>Recommended Actions:</b></p>
+                <ul>
+                    <li>Review resource allocation</li>
+                    <li>Assess external factors</li>
+                    <li>Consider buffer time in schedule</li>
+                    <li>Weekly progress monitoring recommended</li>
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div class='custom-card'>
+                <h4>❌ High Delay Risk</h4>
+                <p>Significant delays are predicted (> 90 days).</p>
+                <p><b>Recommended Actions:</b></p>
+                <ul>
+                    <li>Immediate risk mitigation required</li>
+                    <li>Review project planning</li>
+                    <li>Daily progress monitoring</li>
+                    <li>Consider additional resources</li>
+                    <li>Stakeholder communication plan needed</li>
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)
+        
+        # Factor analysis
+        st.subheader('Key Contributing Factors')
+        factors = []
+        
+        if input_df['External Factor'].iloc[0] != 'Unknown':
+            factors.append(f"External factor: {input_df['External Factor'].iloc[0]}")
+        if input_df['Rainfall (mm)'].iloc[0] > 300:
+            factors.append("High rainfall (above 300mm)")
+        if input_df['Labor Count'].iloc[0] < 100:
+            factors.append("Low labor count")
+        if input_df['Equipment Count'].iloc[0] < 10:
+            factors.append("Insufficient equipment")
+        
+        if factors:
+            st.markdown("""
+            <div class='custom-card'>
+                <p>The following factors are contributing to the predicted delay:</p>
+                <ul>
+            """ + "\n".join([f"<li>{factor}</li>" for factor in factors]) + """
+                </ul>
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.info("No extreme risk factors identified. Delay is primarily due to standard project variables.")
+        
+        # Industry benchmarks
+        st.subheader('Industry Benchmark Statistics')
+        
+        stats = pd.DataFrame({
+            'Metric': ['Average Delay', 'Minimum Delay', 'Maximum Delay', 'Your Project'],
+            'Days': [60, 0, 365, delay_days]
+        })
+        
+        fig = px.bar(
+            stats, 
+            x='Metric', 
+            y='Days', 
+            color='Metric',
+            color_discrete_sequence=['#3498db', '#2ecc71', '#e74c3c', '#f39c12'],
+            title="Comparison with Industry Benchmarks"
+        )
+        st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("""
+        <div class='custom-card'>
+            <ul>
+                <li><b>Average delay</b> in similar projects: 60 days</li>
+                <li><b>Best case scenario</b>: 0 days (on-time completion)</li>
+                <li><b>Worst case scenario</b>: 365 days</li>
+            </ul>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Footer
+    st.markdown("---")
+    st.markdown("""
+    <div class='custom-card'>
+        <p><i>Note: This prediction is based on historical data and machine learning models. 
+        Actual results may vary based on real-world conditions not captured in the model.</i></p>
+    </div>
+    """, unsafe_allow_html=True)
+
 # Main application with navigation
 def main():
     st.sidebar.title("🏗️ Construction Management System")
-    app_mode = st.sidebar.selectbox("Choose the module", 
-                                   ["Supplier Recommendation", "PPE Detection"])
     
+    # Sidebar with icons and better organization
+    with st.sidebar.expander("🔍 Navigation", expanded=True):
+        app_mode = st.radio(
+            "Choose Module",
+            ["Supplier Recommendation", "PPE Detection", "Floor Plan Generator", "Delay Predictor"],
+            index=0
+        )
+    
+    # Add system info in sidebar
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("ℹ️ System Info", expanded=False):
+        st.markdown("""
+        **Version:** 1.0.0  
+        **Last Updated:** June 2024  
+        **Developed by:** Your Team  
+        """)
+    
+    # Add feedback section
+    st.sidebar.markdown("---")
+    with st.sidebar.expander("📝 Feedback", expanded=False):
+        st.text_area("Share your feedback", height=100, key="feedback")
+        if st.button("Submit Feedback"):
+            st.success("Thank you for your feedback!")
+    
+    # Page routing with improved headers
     if app_mode == "Supplier Recommendation":
+        st.header("")
         supplier_recommendation_page()
     elif app_mode == "PPE Detection":
+        st.header("")
         ppe_detection_page()
+    elif app_mode == "Floor Plan Generator":
+        st.header("")
+        floor_plan_generator_page()
+    elif app_mode == "Delay Predictor":
+        st.header("")
+        delay_predictor_page()
 
-# Supplier Recommendation Page
+# Enhanced Supplier Recommendation Page
 def supplier_recommendation_page():
-    st.title("Construction Supplier Recommendation System")
-    st.write("""
-    This application helps you find the best suppliers for construction materials based on your specific requirements.
-    Select your criteria below and get personalized recommendations.
-    """)
+    st.markdown("""
+    <div class='custom-card'>
+        <h2 class='custom-header'>🏭 Supplier Recommendation System</h2>
+        <p>Find the best construction material suppliers based on your specific requirements. 
+        Select your criteria below and get personalized recommendations.</p>
+    </div>
+    """, unsafe_allow_html=True)
     
     # Sidebar for model loading
     st.sidebar.header("Model Configuration")
@@ -453,7 +1013,7 @@ def supplier_recommendation_page():
     """)
     
     # Load model button
-    if st.sidebar.button("Load Model"):
+    if st.sidebar.button("Load Model", type="primary"):
         if os.path.exists(model_path):
             try:
                 model = load_model(model_path)
@@ -501,7 +1061,7 @@ def supplier_recommendation_page():
             min_cost, max_cost = cost_range
         
         # Get recommendations button
-        if st.button("Get Recommendations"):
+        if st.button("Get Recommendations", type="primary"):
             try:
                 # Get recommendations
                 recommendations = recommend_suppliers(
@@ -543,6 +1103,30 @@ def supplier_recommendation_page():
                     with stats_col3:
                         st.metric("Average Cost", f"₹{display_df['Cost per unit (INR)'].mean():.2f}")
                     
+                    # Visualizations
+                    st.subheader("Supplier Comparison")
+                    
+                    fig1 = px.bar(
+                        display_df,
+                        x='Supplier Name',
+                        y='Rating',
+                        title='Supplier Ratings',
+                        color='Rating',
+                        color_continuous_scale='Bluered'
+                    )
+                    st.plotly_chart(fig1, use_container_width=True)
+                    
+                    fig2 = px.scatter(
+                        display_df,
+                        x='Cost per unit (INR)',
+                        y='Average Delivery Time (days)',
+                        size='Rating',
+                        color='Supplier Name',
+                        title='Cost vs Delivery Time',
+                        hover_name='Supplier Name'
+                    )
+                    st.plotly_chart(fig2, use_container_width=True)
+                    
                 else:
                     st.warning("No suppliers found matching your criteria. Try adjusting your parameters.")
                     
@@ -551,85 +1135,103 @@ def supplier_recommendation_page():
     
     # Footer
     st.markdown("---")
-    st.markdown("Supplier Recommendation System - Powered by Machine Learning")
-
-# PPE Detection Page
-def ppe_detection_page():
-    st.title("🦺 PPE Detection System")
     st.markdown("""
-    <div style='background-color: #f0f2f6; padding: 15px; border-radius: 10px;'>
-    <h3>Worker Safety Monitoring System</h3>
-    <p>Monitor and detect PPE (Personal Protective Equipment) compliance in real-time. This system identifies:</p>
-    <ul>
-      <li>🪖 <b>Helmets</b> - Head protection</li>
-      <li>👓 <b>Goggles</b> - Eye protection</li>
-      <li>🧤 <b>Gloves</b> - Hand protection</li>
-      <li>👢 <b>Boots</b> - Foot protection</li>
-      <li>🦺 <b>Vests</b> - High-visibility clothing</li>
-    </ul>
+    <div class='custom-card'>
+        <p><i>Supplier Recommendation System - Powered by Machine Learning</i></p>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Enhanced PPE Detection Page
+def ppe_detection_page():
+    st.markdown("""
+    <div class='custom-card'>
+        <h2 class='custom-header'>🦺 PPE Detection System</h2>
+        <p>Monitor and detect PPE (Personal Protective Equipment) compliance in real-time to ensure worker safety on construction sites.</p>
+        <div style='display: flex; flex-wrap: wrap; gap: 10px; margin-top: 15px;'>
+            <span class='custom-badge' style='background-color: #d4edda;'>🪖 Helmets</span>
+            <span class='custom-badge' style='background-color: #d4edda;'>👓 Goggles</span>
+            <span class='custom-badge' style='background-color: #d4edda;'>🧤 Gloves</span>
+            <span class='custom-badge' style='background-color: #d4edda;'>👢 Boots</span>
+            <span class='custom-badge' style='background-color: #d4edda;'>🦺 Vests</span>
+        </div>
     </div>
     """, unsafe_allow_html=True)
     
     # Sidebar options
-    st.sidebar.header("📋 Settings")
+    st.sidebar.header("⚙️ Settings")
     
     st.sidebar.markdown("### Input Source")
     input_source = st.sidebar.radio("Select detection method:", ["Webcam", "Upload Video"])
+    
+    # Model paths configuration in sidebar
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### Model Configuration")
+    webcam_model_path = st.sidebar.text_input("Webcam Model Path", r"C:\minor\integra\best (1).pt")
+    upload_model_path = st.sidebar.text_input("Upload Video Model Path", r"C:\Users\sanje\Downloads\last.pt")
     
     # Add model information in sidebar
     st.sidebar.markdown("---")
     st.sidebar.markdown("### ℹ System Information")
     st.sidebar.markdown("""
-    - *Model*: YOLOv8 Custom
-    - *Classes*: Helmet, Goggles, Gloves, Boots, Vest, Person
+    - *Webcam Model*: Optimized for real-time processing
+    - *Upload Model*: Higher accuracy for detailed analysis
     - *Version*: 1.0.0
     """)
     
-    # Add help section in sidebar
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### 🆘 Help")
-    with st.sidebar.expander("How to use this app"):
-        st.markdown("""
-        1. Select input source (Webcam or Video Upload)
-        2. For webcam, click "Start Detection"
-        3. For video upload, upload a file and click "Process Video"
-        4. View results in the Analytics tab
-        5. Generate PDF reports in the Report tab
-        """)
-        
-    with st.sidebar.expander("About PPE Detection"):
-        st.markdown("""
-        Personal Protective Equipment (PPE) is crucial for workplace safety.
-        
-        This application uses computer vision to detect whether workers are
-        wearing the required safety equipment, helping to maintain compliance
-        with safety regulations.
-        """)
-    
-    # Load model at startup
+    # Load models
     @st.cache_resource
-    def load_ppe_model():
-        return YOLO(r"C:\minor\integra\best (1).pt")  # You can make this path configurable
+    def load_webcam_model():
+        try:
+            if os.path.exists(webcam_model_path):
+                return YOLO(webcam_model_path)
+            else:
+                st.error(f"Webcam model not found at: {webcam_model_path}")
+                return None
+        except Exception as e:
+            st.error(f"Error loading webcam model: {e}")
+            return None
     
-    try:
-        with st.spinner("Loading PPE detection model..."):
-            model = load_ppe_model()
-        st.sidebar.success("Model loaded successfully!")
-    except Exception as e:
-        st.sidebar.error(f"Error loading model: {e}")
+    @st.cache_resource
+    def load_upload_model():
+        try:
+            if os.path.exists(upload_model_path):
+                return YOLO(upload_model_path)
+            else:
+                st.error(f"Upload model not found at: {upload_model_path}")
+                return None
+        except Exception as e:
+            st.error(f"Error loading upload model: {e}")
+            return None
+    
+    # Load appropriate model based on input source
+    if input_source == "Webcam":
+        with st.spinner("Loading webcam model (optimized for real-time)..."):
+            model = load_webcam_model()
+    else:
+        with st.spinner("Loading upload model (higher accuracy)..."):
+            model = load_upload_model()
+    
+    if model is None:
+        st.error("Failed to load model. Please check the model paths.")
         st.stop()
     
-    # Initialize tracker
-    tracker = DetectionTracker()
+    # Initialize tracker in session state if not exists
+    if 'tracker' not in st.session_state:
+        st.session_state.tracker = DetectionTracker()
     
     # Main content area with tabs
-    tab1, tab2, tab3 = st.tabs(["Detection", "Analytics", "Report"])
+    tab1, tab2, tab3 = st.tabs(["📷 Detection", "📊 Analytics", "📄 Report"])
     
     with tab1:
         if input_source == "Webcam":
             st.subheader("Webcam Feed")
-            run_detection = st.button("Start Detection")
-            stop_detection = st.button("Stop Detection")
+            st.info("Using real-time optimized model for webcam processing")
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                run_detection = st.button("Start Detection", type="primary")
+            with col2:
+                stop_detection = st.button("Stop Detection")
             
             stframe = st.empty()
             
@@ -658,7 +1260,7 @@ def ppe_detection_page():
                 out = cv2.VideoWriter(output_file, fourcc, fps, (width, height))
                 
                 # Reset tracker for new session
-                tracker.reset()
+                st.session_state.tracker.reset()
                 
                 try:
                     while True:
@@ -667,7 +1269,7 @@ def ppe_detection_page():
                             break
                         
                         frame_count += 1
-                        annotated_frame = process_frame(frame, model, tracker, start_time, fps, frame_count)
+                        annotated_frame = process_frame(frame, model, st.session_state.tracker, start_time, fps, frame_count)
                         out.write(annotated_frame)
                         
                         # Convert BGR to RGB for display
@@ -684,11 +1286,12 @@ def ppe_detection_page():
                     cap.release()
                     out.release()
                     st.session_state.output_file = output_file
-                    st.session_state.tracker = tracker
                     st.success(f"Detection complete! Processed {frame_count} frames.")
         
         elif input_source == "Upload Video":
             st.subheader("Upload Video")
+            st.info("Using high-accuracy model for video processing")
+            
             uploaded_file = st.file_uploader("Choose a video file", type=["mp4", "avi", "mov"])
             
             if uploaded_file is not None:
@@ -698,7 +1301,7 @@ def ppe_detection_page():
                 video_path = temp_file.name
                 
                 st.video(uploaded_file)
-                process_button = st.button("Process Video")
+                process_button = st.button("Process Video", type="primary")
                 
                 if process_button:
                     cap = cv2.VideoCapture(video_path)
@@ -725,7 +1328,7 @@ def ppe_detection_page():
                     out = cv2.VideoWriter(output_file, fourcc, fps, (width, height))
                     
                     # Reset tracker for new session
-                    tracker.reset()
+                    st.session_state.tracker.reset()
                     
                     start_time = datetime.now()
                     frame_count = 0
@@ -737,7 +1340,7 @@ def ppe_detection_page():
                                 break
                             
                             frame_count += 1
-                            annotated_frame = process_frame(frame, model, tracker, start_time, fps, frame_count)
+                            annotated_frame = process_frame(frame, model, st.session_state.tracker, start_time, fps, frame_count)
                             out.write(annotated_frame)
                             
                             # Update progress
@@ -751,7 +1354,6 @@ def ppe_detection_page():
                         cap.release()
                         out.release()
                         st.session_state.output_file = output_file
-                        st.session_state.tracker = tracker
                         st.success(f"Processing complete! Processed {frame_count} frames.")
                         
                         # Show processed video
@@ -769,7 +1371,7 @@ def ppe_detection_page():
     with tab2:
         st.subheader("Analytics Dashboard")
         
-        if hasattr(st.session_state, 'tracker'):
+        if 'tracker' in st.session_state:
             tracker = st.session_state.tracker
             
             # Display basic stats
@@ -786,8 +1388,39 @@ def ppe_detection_page():
                     st.metric("Violation Rate", "0%")
             
             # Create and display charts
-            fig_pie, fig_bar = create_stats_charts(tracker)
-            if fig_pie and fig_bar:
+            if len(tracker.person_safety_violations) > 0:
+                # Count violation types
+                violation_types = {
+                    "No Helmet": 0, 
+                    "No Goggles": 0, 
+                    "No Gloves": 0, 
+                    "No Boots": 0, 
+                    "No Vest": 0
+                }
+                
+                for violation in tracker.person_safety_violations:
+                    details = violation["details"]
+                    if details in violation_types:
+                        violation_types[details] += 1
+                
+                # Create pie chart
+                fig_pie = px.pie(
+                    names=list(violation_types.keys()),
+                    values=list(violation_types.values()),
+                    title="Safety Violations by Type",
+                    color_discrete_sequence=px.colors.qualitative.Set3
+                )
+                
+                # Create bar chart
+                fig_bar = px.bar(
+                    x=list(violation_types.keys()),
+                    y=list(violation_types.values()),
+                    title="Safety Violations Count",
+                    color=list(violation_types.keys()),
+                    color_discrete_sequence=px.colors.qualitative.Set2,
+                    labels={'x': 'Violation Type', 'y': 'Count'}
+                )
+                
                 col1, col2 = st.columns(2)
                 with col1:
                     st.plotly_chart(fig_pie, use_container_width=True)
@@ -795,21 +1428,21 @@ def ppe_detection_page():
                     st.plotly_chart(fig_bar, use_container_width=True)
                 
                 # Show violations table
-                if tracker.person_safety_violations:
-                    st.subheader("Safety Violations Log")
-                    violations_df = pd.DataFrame(tracker.person_safety_violations)
-                    st.dataframe(violations_df, use_container_width=True)
-                else:
-                    st.info("No safety violations detected.")
+                st.subheader("Safety Violations Log")
+                violations_df = pd.DataFrame(tracker.person_safety_violations)
+                st.dataframe(violations_df, use_container_width=True)
             else:
-                st.info("No data available for visualization. Run detection first.")
+                if len(tracker.seen_persons) > 0:
+                    st.success("All workers are properly equipped with PPE - no violations detected!")
+                else:
+                    st.info("No detection data available. Run detection first.")
         else:
             st.info("No detection data available. Run detection first.")
     
     with tab3:
         st.subheader("Safety Report")
         
-        if hasattr(st.session_state, 'tracker') and hasattr(st.session_state, 'output_file'):
+        if 'tracker' in st.session_state and 'output_file' in st.session_state:
             tracker = st.session_state.tracker
             output_file = st.session_state.output_file
             
@@ -819,7 +1452,7 @@ def ppe_detection_page():
             
             col1, col2 = st.columns([1, 2])
             with col1:
-                generate_report = st.button("Generate PDF Report")
+                generate_report = st.button("Generate PDF Report", type="primary")
             
             if generate_report:
                 with st.spinner("Generating PDF report..."):
@@ -846,14 +1479,17 @@ def ppe_detection_page():
                 st.subheader("Report Preview")
                 st.info("A downloadable PDF report has been generated with detailed safety compliance information.")
                 st.markdown("""
-                The PDF report includes:
-                - Summary of safety statistics
-                - Breakdown of violation types 
-                - Complete timeline of all safety violations
-                - Timestamps and details for each incident
-                
-                Click the 'Download PDF Report' button above to save this report.
-                """)
+                <div class='custom-card'>
+                    <p>The PDF report includes:</p>
+                    <ul>
+                        <li>Summary of safety statistics</li>
+                        <li>Breakdown of violation types</li>
+                        <li>Complete timeline of all safety violations</li>
+                        <li>Timestamps and details for each incident</li>
+                    </ul>
+                    <p>Click the 'Download PDF Report' button above to save this report.</p>
+                </div>
+                """, unsafe_allow_html=True)
         else:
             st.info("No detection data available. Run detection first.")
 
